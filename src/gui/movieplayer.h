@@ -117,7 +117,18 @@ class CMoviePlayerGui : public CMenuTarget
 		WEBTV_ERROR_DNS_TIMEOUT,
 		WEBTV_ERROR_DNS_BLOCKER_SUSPECTED,
 		WEBTV_ERROR_DNS_OK_CONNECTION_FAILED,
-		WEBTV_ERROR_USER_ZAP_CANCELLED_RETRY
+		WEBTV_ERROR_USER_ZAP_CANCELLED_RETRY,
+		WEBTV_ERROR_IMMEDIATE_EXIT,
+		WEBTV_ERROR_INVALID_DATA,
+		WEBTV_ERROR_USER_ABORT
+	};
+
+	enum webtv_abort_reason_t
+	{
+		WEBTV_ABORT_NONE = 0,
+		WEBTV_ABORT_USER_BACK_STOP,
+		WEBTV_ABORT_USER_QUICKZAP,
+		WEBTV_ABORT_STOP_PLAYBACK
 	};
 
 	typedef struct webtv_request_t
@@ -172,6 +183,9 @@ class CMoviePlayerGui : public CMenuTarget
 	std::string	glcd_end;
 #endif
 
+	std::string	file_name;
+	std::string	second_file_name;//separate audio file for ARM BOX
+	std::string	pretty_name;
 	std::string	cookie_header;
 	std::string	info_1, info_2;
 	std::string    	currentaudioname;
@@ -240,7 +254,6 @@ class CMoviePlayerGui : public CMenuTarget
 	int menu_ret;
 	bool autoshot_done;
 	bool timeshift_deletion;
-	bool timeshift_to_record;
 	//std::vector<livestream_info_t> liveStreamList;
 
 	/* playback from bookmark */
@@ -258,6 +271,7 @@ class CMoviePlayerGui : public CMenuTarget
 	static bool webtv_restart_transition;
 	static uint64_t webtv_generation;
 	static uint64_t webtv_abort_generation;
+	static webtv_abort_reason_t webtv_abort_reason;
 	static webtv_request_t webtv_request;
 	static webtv_failure_t webtv_failure;
 
@@ -305,10 +319,14 @@ class CMoviePlayerGui : public CMenuTarget
 	static void* bgPlayThread(void *arg);
 	static bool sortStreamList(livestream_info_t info1, livestream_info_t info2);
 	static const char *webtvErrorReasonToString(webtv_error_reason_t reason);
+	static const char *webtvAbortReasonToString(webtv_abort_reason_t reason);
 	static void clearWebtvFailureLocked();
+	static void markWebtvAbortLocked(webtv_abort_reason_t reason);
 	static void recordWebtvFailure(webtv_error_reason_t reason, t_channel_id chan, uint64_t generation, const std::string &host = "", const std::string &address = "", int ffmpeg_code = 0, const std::string &ffmpeg_message = "");
+	static bool isWebtvSilentFailureLocked(t_channel_id chan, uint64_t generation);
 	static bool prepareWebtvRestartLocked(t_channel_id chan, uint64_t generation);
 	static bool getPlaybackLastOpenError(int &code, std::string &message);
+	static webtv_error_reason_t classifyWebtvOpenError(int code, bool dns_ok);
 	static bool classifyWebtvDnsErrorText(const std::string &text, const std::string &source_url, webtv_error_reason_t &reason, std::string &host);
 	bool selectLivestream(std::vector<livestream_info_t> &streamList, int res, livestream_info_t* info);
 	bool luaGetUrl(const std::string &script, const std::string &file, std::vector<livestream_info_t> &streamList, std::string *error_string = NULL);
@@ -328,9 +346,6 @@ class CMoviePlayerGui : public CMenuTarget
 	static bool ConsumeWebtvFailureMessage(t_channel_id failed_channel_id, std::string &message);
 
 	MI_MOVIE_INFO * p_movie_info;
-	std::string	file_name;
-	std::string	second_file_name;//separate audio file for ARM BOX
-	std::string	pretty_name;
 	int exec(CMenuTarget* parent, const std::string & actionKey);
 	bool Playing() { return playing; };
 	std::string CurrentAudioName() { return currentaudioname; };
@@ -341,7 +356,6 @@ class CMoviePlayerGui : public CMenuTarget
 	void UpdatePosition();
 	tshift_mode timeshift;
 	void deleteTimeshift() { timeshift_deletion = true; }
-	void moveTimeshift() { timeshift_to_record = true; }
 	int file_prozent;
 	static cPlayback *getPlayback();
 	void SetFile(std::string &name, std::string &file, std::string info1="", std::string info2="", std::string file2="") { pretty_name = name; file_name = file; info_1 = info1; info_2 = info2; second_file_name = file2; }
