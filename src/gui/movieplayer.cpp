@@ -88,8 +88,14 @@
 #include <iconv.h>
 #include <system/stacktrace.h>
 
-//NI InfoIcons
+extern "C" {
+#include <libavutil/common.h>
+#include <libavutil/error.h>
+}
+
+#if 0
 #include <gui/infoicons.h>
+#endif
 
 #if HAVE_CST_HARDWARE || HAVE_ARM_HARDWARE || HAVE_MIPS_HARDWARE
 #define LCD_MODE CVFD::MODE_MENU_UTF8
@@ -112,8 +118,6 @@ extern CTimeOSD *FileTimeOSD;
 #define NO_MUTE false
 #define WEBTV_STOP_TIMEOUT_MS 1500
 #define WEBTV_STOP_POLL_MS 10
-#define WEBTV_CONNECTION_RESET_CODE (-ECONNRESET)
-#define WEBTV_IMMEDIATE_EXIT_CODE -1414092869 /* FFmpeg AVERROR_EXIT, FourCC 'EXIT'. */
 #define WEBTV_DNS_TIMEOUT_MS 3000
 
 CMoviePlayerGui* CMoviePlayerGui::instance_mp = NULL;
@@ -130,6 +134,7 @@ bool CMoviePlayerGui::webtv_retry_pending = false;
 bool CMoviePlayerGui::webtv_restart_transition = false;
 uint64_t CMoviePlayerGui::webtv_generation = 0;
 uint64_t CMoviePlayerGui::webtv_abort_generation = 0;
+CMoviePlayerGui::webtv_abort_reason_t CMoviePlayerGui::webtv_abort_reason = WEBTV_ABORT_NONE;
 CMoviePlayerGui::webtv_request_t CMoviePlayerGui::webtv_request;
 CMoviePlayerGui::webtv_failure_t CMoviePlayerGui::webtv_failure;
 CMovieBrowser* CMoviePlayerGui::moviebrowser = NULL;
@@ -446,7 +451,28 @@ const char *CMoviePlayerGui::webtvErrorReasonToString(webtv_error_reason_t reaso
 			return "dns_ok_connection_failed";
 		case WEBTV_ERROR_USER_ZAP_CANCELLED_RETRY:
 			return "user_zap_cancelled_retry";
+		case WEBTV_ERROR_IMMEDIATE_EXIT:
+			return "immediate_exit";
+		case WEBTV_ERROR_INVALID_DATA:
+			return "invalid_data";
+		case WEBTV_ERROR_USER_ABORT:
+			return "user_abort";
 		case WEBTV_ERROR_NONE:
+		default:
+			return "none";
+	}
+}
+
+const char *CMoviePlayerGui::webtvAbortReasonToString(webtv_abort_reason_t reason)
+{
+	switch (reason) {
+		case WEBTV_ABORT_USER_BACK_STOP:
+			return "user_back_stop";
+		case WEBTV_ABORT_USER_QUICKZAP:
+			return "user_quickzap";
+		case WEBTV_ABORT_STOP_PLAYBACK:
+			return "stop_playback";
+		case WEBTV_ABORT_NONE:
 		default:
 			return "none";
 	}
@@ -464,8 +490,26 @@ void CMoviePlayerGui::clearWebtvFailureLocked()
 	webtv_failure.address.clear();
 }
 
+void CMoviePlayerGui::markWebtvAbortLocked(webtv_abort_reason_t reason)
+{
+	if (!webtv_request.generation)
+		return;
+
+	if (webtv_abort_generation == webtv_request.generation && webtv_abort_reason == reason)
+		return;
+
+	webtv_abort_generation = webtv_request.generation;
+	webtv_abort_reason = reason;
+	printf("[webtv] abort marker set generation=%llu reason=%s\n",
+		(unsigned long long)webtv_abort_generation,
+		webtvAbortReasonToString(reason));
+}
+
 void CMoviePlayerGui::recordWebtvFailure(webtv_error_reason_t reason, t_channel_id chan, uint64_t generation, const std::string &host, const std::string &address, int ffmpeg_code, const std::string &ffmpeg_message)
 {
+	webtv_abort_reason_t abort_reason = WEBTV_ABORT_NONE;
+	uint64_t abort_generation = 0;
+
 	mutex.lock();
 	webtv_failure.valid = true;
 	webtv_failure.reason = reason;
@@ -475,25 +519,61 @@ void CMoviePlayerGui::recordWebtvFailure(webtv_error_reason_t reason, t_channel_
 	webtv_failure.ffmpeg_message = ffmpeg_message;
 	webtv_failure.host = host;
 	webtv_failure.address = address;
+	abort_reason = webtv_abort_reason;
+	abort_generation = webtv_abort_generation;
 	mutex.unlock();
 
-	printf("[webtv] classification=%s channel=%llx generation=%llu host=%s address=%s ff_error_code=%d ff_error_msg=%s\n",
+	printf("[webtv] classification=%s channel=%llx generation=%llu host=%s address=%s abort_generation=%llu abort_reason=%s ff_error_code=%d ff_error_msg=%s\n",
 		webtvErrorReasonToString(reason),
 		(unsigned long long)chan,
 		(unsigned long long)generation,
 		host.c_str(),
 		address.c_str(),
+		(unsigned long long)abort_generation,
+		webtvAbortReasonToString(abort_reason),
 		ffmpeg_code,
 		ffmpeg_message.c_str());
 }
 
-bool CMoviePlayerGui::prepareWebtvRestartLocked(t_channel_id chan, uint64_t generation)
+bool CMoviePlayerGui::isWebtvSilentFailureLocked(t_channel_id chan, uint64_t generation)
 {
 	if (!webtv_failure.valid ||
-	    webtv_failure.reason != WEBTV_ERROR_CONNECTION_RESET_BY_PEER ||
 	    webtv_failure.channel_id != chan ||
 	    webtv_failure.generation != generation)
 		return false;
+
+	bool silent = webtv_failure.reason == WEBTV_ERROR_USER_ABORT ||
+		      webtv_failure.reason == WEBTV_ERROR_USER_ZAP_CANCELLED_RETRY;
+	if (silent) {
+		printf("[webtv] suppressing zap failure channel=%llx generation=%llu reason=%s abort_reason=%s\n",
+			(unsigned long long)chan,
+			(unsigned long long)generation,
+			webtvErrorReasonToString(webtv_failure.reason),
+			webtvAbortReasonToString(webtv_abort_reason));
+		clearWebtvFailureLocked();
+	}
+	return silent;
+}
+
+bool CMoviePlayerGui::prepareWebtvRestartLocked(t_channel_id chan, uint64_t generation)
+{
+	bool restartable = webtv_failure.valid &&
+			   (webtv_failure.reason == WEBTV_ERROR_CONNECTION_RESET_BY_PEER ||
+			    webtv_failure.reason == WEBTV_ERROR_INVALID_DATA);
+	if (!webtv_failure.valid ||
+	    !restartable ||
+	    webtv_failure.channel_id != chan ||
+	    webtv_failure.generation != generation)
+		return false;
+
+	if (webtv_abort_generation == generation) {
+		printf("[webtv] restart suppressed because abort marker is active channel=%llx generation=%llu abort_reason=%s\n",
+			(unsigned long long)chan,
+			(unsigned long long)generation,
+			webtvAbortReasonToString(webtv_abort_reason));
+		clearWebtvFailureLocked();
+		return false;
+	}
 
 	if (g_settings.webtv_stream_restart_attempts <= 0)
 		return false;
@@ -524,6 +604,19 @@ bool CMoviePlayerGui::prepareWebtvRestartLocked(t_channel_id chan, uint64_t gene
 		webtvRedactUrlForLog(webtv_request.original_url).c_str(),
 		webtv_request.script.c_str());
 	return true;
+}
+
+CMoviePlayerGui::webtv_error_reason_t CMoviePlayerGui::classifyWebtvOpenError(int code, bool dns_ok)
+{
+	if (code == AVERROR(ECONNRESET))
+		return WEBTV_ERROR_CONNECTION_RESET_BY_PEER;
+	if (code == AVERROR_INVALIDDATA)
+		return WEBTV_ERROR_INVALID_DATA;
+	if (code == AVERROR_EXIT)
+		return WEBTV_ERROR_IMMEDIATE_EXIT;
+	if (dns_ok)
+		return WEBTV_ERROR_DNS_OK_CONNECTION_FAILED;
+	return WEBTV_ERROR_NORMAL_CONNECT_FAILED;
 }
 
 bool CMoviePlayerGui::getPlaybackLastOpenError(int &code, std::string &message)
@@ -781,7 +874,7 @@ void CMoviePlayerGui::restoreNeutrino()
 	if (isUPNP)
 		return;
 
-	//NI
+
 	CZapit::getInstance()->setMoviePlayer(true);// let CCamManager::SetMode know, the call is from MoviePlayer
 
 #if ! HAVE_CST_HARDWARE
@@ -814,19 +907,20 @@ int CMoviePlayerGui::exec(CMenuTarget * parent, const std::string & actionKey)
 	if (parent)
 		parent->hide();
 
+
 	if (actionKey == "fileplayback_video" || actionKey == "fileplayback_audio" || actionKey == "tsmoviebrowser")
 	{
 		if (actionKey == "fileplayback_video") {
 			printf("[movieplayer] wakeup_hdd(%s) for %s\n", g_settings.network_nfs_moviedir.c_str(), actionKey.c_str());
-			wakeup_hdd(g_settings.network_nfs_moviedir.c_str(), true);
+			wakeup_hdd(g_settings.network_nfs_moviedir.c_str());
 		}
 		else if (actionKey == "fileplayback_audio") {
 			printf("[movieplayer] wakeup_hdd(%s) for %s\n", g_settings.network_nfs_audioplayerdir.c_str(), actionKey.c_str());
-			wakeup_hdd(g_settings.network_nfs_audioplayerdir.c_str(), true);
+			wakeup_hdd(g_settings.network_nfs_audioplayerdir.c_str());
 		}
 		else {
 			printf("[movieplayer] wakeup_hdd(%s) for %s\n", g_settings.network_nfs_recordingdir.c_str(), actionKey.c_str());
-			wakeup_hdd(g_settings.network_nfs_recordingdir.c_str(), true);
+			wakeup_hdd(g_settings.network_nfs_recordingdir.c_str());
 		}
 	}
 
@@ -882,8 +976,7 @@ int CMoviePlayerGui::exec(CMenuTarget * parent, const std::string & actionKey)
 	else if (actionKey == "timeshift_rewind") {
 		timeshift = TSHIFT_MODE_REWIND;
 	}
-#if 0
-	// TODO - not supported
+#if 0 // TODO ?
 	else if (actionKey == "bookmarkplayback") {
 		isBookmark = true;
 	}
@@ -1139,7 +1232,6 @@ void CMoviePlayerGui::Cleanup()
 	p_movie_info = NULL;
 	autoshot_done = false;
 	timeshift_deletion = false;
-	timeshift_to_record = false;
 	currentaudioname = "Unk";
 }
 
@@ -1171,7 +1263,6 @@ void CMoviePlayerGui::enableOsdElements(bool mute)
 		CAudioMute::getInstance()->enableMuteIcon(true);
 
 	CInfoClock::getInstance()->enableInfoClock(true);
-	CInfoIcons::getInstance()->enableInfoIcons(true); //NI InfoIcons
 }
 
 void CMoviePlayerGui::disableOsdElements(bool mute)
@@ -1180,7 +1271,6 @@ void CMoviePlayerGui::disableOsdElements(bool mute)
 		CAudioMute::getInstance()->enableMuteIcon(false);
 
 	CInfoClock::getInstance()->enableInfoClock(false);
-	CInfoIcons::getInstance()->enableInfoIcons(false); //NI InfoIcons
 }
 
 void CMoviePlayerGui::makeFilename()
@@ -1263,8 +1353,9 @@ bool CMoviePlayerGui::SelectFile()
 	}
 
 	printf("CMoviePlayerGui::SelectFile: isBookmark %d timeshift %d isMovieBrowser %d is_audio_playing %d\n", isBookmark, timeshift, isMovieBrowser, is_audio_playing);
-	//wakeup_hdd(g_settings.network_nfs_recordingdir.c_str());
-
+#if 0
+	wakeup_hdd(g_settings.network_nfs_recordingdir.c_str());
+#endif
 	if (timeshift != TSHIFT_MODE_OFF) {
 		t_channel_id live_channel_id = CZapit::getInstance()->GetCurrentChannelID();
 		p_movie_info = CRecordManager::getInstance()->GetMovieInfo(live_channel_id);
@@ -1273,8 +1364,7 @@ bool CMoviePlayerGui::SelectFile()
 		makeFilename();
 		ret = true;
 	}
-#if 0
-	// TODO - not supported
+#if 0 // TODO
 	else if (isBookmark) {
 		const CBookmark * theBookmark = bookmarkmanager->getBookmark(NULL);
 		if (theBookmark == NULL) {
@@ -1361,6 +1451,8 @@ void *CMoviePlayerGui::ShowStartHint(void *arg)
 				g_RCInput->clearRCMsg();
 			}
 			mutex.lock();
+			if (caller->isWebChannel)
+				markWebtvAbortLocked(WEBTV_ABORT_USER_BACK_STOP);
 			if (caller->playback)
 				caller->playback->RequestAbort();
 			mutex.unlock();
@@ -1372,6 +1464,7 @@ void *CMoviePlayerGui::ShowStartHint(void *arg)
 #endif
 		else if (caller->isWebChannel && ((msg == (neutrino_msg_t) g_settings.key_quickzap_up ) || (msg == (neutrino_msg_t) g_settings.key_quickzap_down))) {
 			mutex.lock();
+			markWebtvAbortLocked(WEBTV_ABORT_USER_QUICKZAP);
 			if (caller->playback)
 				caller->playback->RequestAbort();
 			mutex.unlock();
@@ -1461,6 +1554,7 @@ bool CMoviePlayerGui::checkWebtvDns(uint64_t generation, t_channel_id chan, cons
 			freeaddrinfo(result);
 		printf("[webtv] classification=user_zap_cancelled_retry channel=%llx generation=%llu during_dns host=%s\n",
 			(unsigned long long)chan, (unsigned long long)generation, dns.host.c_str());
+		recordWebtvFailure(WEBTV_ERROR_USER_ZAP_CANCELLED_RETRY, chan, generation, dns.host);
 		return false;
 	}
 
@@ -1536,6 +1630,7 @@ bool CMoviePlayerGui::StartWebtv(void)
 		if (!request_current) {
 			printf("[webtv] classification=user_zap_cancelled_retry channel=%llx generation=%llu before_start\n",
 				(unsigned long long)request_channel, (unsigned long long)request_generation);
+			recordWebtvFailure(WEBTV_ERROR_USER_ZAP_CANCELLED_RETRY, request_channel, request_generation, dns.host, dns.address);
 			return false;
 		}
 	}
@@ -1584,19 +1679,22 @@ bool CMoviePlayerGui::StartWebtv(void)
 		mutex.lock();
 		bool request_current = webtv_request.generation == request_generation && webtv_request.channel_id == request_channel;
 		bool abort_requested = webtv_abort_generation == request_generation;
+		webtv_abort_reason_t abort_reason = webtv_abort_reason;
 		mutex.unlock();
 		if (!request_current || abort_requested) {
 			int abort_code = 0;
 			std::string abort_message;
 			bool have_abort_error = abort_requested && getPlaybackLastOpenError(abort_code, abort_message);
-			printf("[webtv] classification=user_zap_cancelled_retry channel=%llx generation=%llu request_current=%d abort_requested=%d ff_error_code=%d ff_error_msg=%s\n",
+			printf("[webtv] classification=%s channel=%llx generation=%llu request_current=%d abort_requested=%d abort_reason=%s ff_error_code=%d ff_error_msg=%s\n",
+				abort_requested ? webtvErrorReasonToString(WEBTV_ERROR_USER_ABORT) : webtvErrorReasonToString(WEBTV_ERROR_USER_ZAP_CANCELLED_RETRY),
 				(unsigned long long)request_channel,
 				(unsigned long long)request_generation,
 				request_current,
 				abort_requested,
+				webtvAbortReasonToString(abort_reason),
 				have_abort_error ? abort_code : 0,
 				have_abort_error ? abort_message.c_str() : "");
-			recordWebtvFailure(WEBTV_ERROR_USER_ZAP_CANCELLED_RETRY, request_channel, request_generation, dns.host, dns.address,
+			recordWebtvFailure(abort_requested ? WEBTV_ERROR_USER_ABORT : WEBTV_ERROR_USER_ZAP_CANCELLED_RETRY, request_channel, request_generation, dns.host, dns.address,
 				have_abort_error ? abort_code : 0, have_abort_error ? abort_message : "");
 			return false;
 		}
@@ -1610,13 +1708,7 @@ bool CMoviePlayerGui::StartWebtv(void)
 				(unsigned long long)request_channel, (unsigned long long)request_generation);
 		}
 
-		webtv_error_reason_t reason = WEBTV_ERROR_NORMAL_CONNECT_FAILED;
-		if (have_ffmpeg_error && ffmpeg_code == WEBTV_CONNECTION_RESET_CODE)
-			reason = WEBTV_ERROR_CONNECTION_RESET_BY_PEER;
-		else if (have_ffmpeg_error && ffmpeg_code == WEBTV_IMMEDIATE_EXIT_CODE)
-			reason = WEBTV_ERROR_NORMAL_CONNECT_FAILED;
-		else if (dns.checked && dns.reason == WEBTV_ERROR_NONE)
-			reason = WEBTV_ERROR_DNS_OK_CONNECTION_FAILED;
+		webtv_error_reason_t reason = classifyWebtvOpenError(have_ffmpeg_error ? ffmpeg_code : 0, dns.checked && dns.reason == WEBTV_ERROR_NONE);
 
 		recordWebtvFailure(reason, request_channel, request_generation, dns.host, dns.address, ffmpeg_code, ffmpeg_message);
 	}
@@ -1664,6 +1756,10 @@ void* CMoviePlayerGui::bgPlayThread(void *arg)
 	else if (!started){
 		if (prepareWebtvRestartLocked(*(t_channel_id*)chid, request_generation))
 			g_RCInput->postMsg(NeutrinoMessages::EVT_WEBTV_RESTART, (neutrino_msg_data_t) chid);
+		else if (isWebtvSilentFailureLocked(*(t_channel_id*)chid, request_generation)) {
+			delete [] chid;
+			chid = nullptr;
+		}
 		else
 			g_RCInput->postMsg(NeutrinoMessages::EVT_ZAP_FAILED, (neutrino_msg_data_t) chid);
 		chidused = true;
@@ -2120,6 +2216,8 @@ bool CMoviePlayerGui::PlayBackgroundStart(const std::string &file, const std::st
 	webtv_request.channel_id = chan;
 	webtv_request.generation = webtv_generation;
 	webtv_request.restart_attempts = restart_attempts;
+	webtv_abort_generation = 0;
+	webtv_abort_reason = WEBTV_ABORT_NONE;
 	webtv_retry_pending = false;
 	clearWebtvFailureLocked();
 	webtv_starting = true;
@@ -2292,7 +2390,7 @@ void CMoviePlayerGui::stopPlayBack(void)
 	uint64_t stopping_generation = webtv_request.generation;
 	webtv_generation++;
 	if (stopping_generation)
-		webtv_abort_generation = stopping_generation;
+		markWebtvAbortLocked(WEBTV_ABORT_STOP_PLAYBACK);
 	if (!webtv_restart_transition) {
 		webtv_retry_pending = false;
 		clearWebtvFailureLocked();
@@ -2530,27 +2628,23 @@ bool CMoviePlayerGui::SetPosition(int pos, bool absolute)
 	mutex.lock();
 	if (playback)
 		res = playback->SetPosition(pos, absolute);
-	if (is_file_player && res && speed == 0 && playstate == CMoviePlayerGui::PAUSE)
-	{
+	if (is_file_player && res && speed == 0 && playstate == CMoviePlayerGui::PAUSE){
 		playstate = CMoviePlayerGui::PLAY;
 		speed = 1;
 		if (playback)
 			playback->SetSpeed(speed);
 	}
 	mutex.unlock();
-	FileTimeOSD_tmp = 0;
 
-#if 0
 	if (res)
 		g_RCInput->postMsg(CRCInput::RC_info, 0);
-#endif
 
 	return res;
 }
 
 void CMoviePlayerGui::quickZap(neutrino_msg_t msg)
 {
-	if (msg == CRCInput::RC_right || msg == CRCInput::RC_nextsong || msg == (neutrino_msg_t) g_settings.key_quickzap_up)
+	if ((msg == CRCInput::RC_right) || msg == (neutrino_msg_t) g_settings.key_quickzap_up)
 	{
 		//printf("CMoviePlayerGui::%s: CRCInput::RC_right or g_settings.key_quickzap_up\n", __func__);
 		if (isLuaPlay || isUPNP)
@@ -2582,7 +2676,7 @@ void CMoviePlayerGui::quickZap(neutrino_msg_t msg)
 			CNeutrinoApp::getInstance()->channelList->quickZap(msg);
 		}
 	}
-	else if (msg == CRCInput::RC_left || msg == CRCInput::RC_previoussong || msg == (neutrino_msg_t) g_settings.key_quickzap_down)
+	else if ((msg == CRCInput::RC_left) || msg == (neutrino_msg_t) g_settings.key_quickzap_down)
 	{
 		//printf("CMoviePlayerGui::%s: CRCInput::RC_left or g_settings.key_quickzap_down\n", __func__);
 		if (isLuaPlay || isUPNP)
@@ -2611,7 +2705,7 @@ void CMoviePlayerGui::PlayFileLoop(void)
 {
 	bool first_start = true;
 	bool update_lcd = true;
-	neutrino_msg_t lastmsg = 0;
+//	neutrino_msg_t lastmsg = 0;
 #if HAVE_CST_HARDWARE
 	int eof = 0;
 	int eof2 = 0;
@@ -2620,13 +2714,11 @@ void CMoviePlayerGui::PlayFileLoop(void)
 	bool at_eof = !(playstate >= CMoviePlayerGui::PLAY);;
 	keyPressed = CMoviePlayerGui::PLUGIN_PLAYSTATE_NORMAL;
 
-	//NI - bisectional jumps
+#if 0	//bisectional jumps
 	int bisection_jump = g_settings.movieplayer_bisection_jump * 60;
 	int bisection_loop = -1;
 	int bisection_loop_max = 5;
-
-	FileTimeOSD_tmp = -1;
-
+#endif
 	while (playstate >= CMoviePlayerGui::PLAY)
 	{
 		bool show_playtime = (g_settings.movieplayer_display_playtime || g_info.hw_caps->display_type == HW_DISPLAY_LED_NUM);
@@ -2654,36 +2746,28 @@ void CMoviePlayerGui::PlayFileLoop(void)
 				handle_key_pause = false;
 		}
 
-		//NI - bisectional jumps
+#if 0		//bisectional jumps
+		if (g_settings.mpkey_play == g_settings.mpkey_pause)
+		{
+			if (playstate == CMoviePlayerGui::PLAY)
+				handle_key_play = false;
+			else if (playstate == CMoviePlayerGui::PAUSE)
+				handle_key_pause = false;
+		}
+
 		if (bisection_loop > -1)
 			bisection_loop++;
 		if (bisection_loop > bisection_loop_max)
 			bisection_loop = -1;
-
-		if (FileTimeOSD_tmp > -1)
-			FileTimeOSD_tmp++;
-
+#endif
 		if ((playstate >= CMoviePlayerGui::PLAY) && (timeshift != TSHIFT_MODE_OFF || (playstate != CMoviePlayerGui::PAUSE))) {
 			mutex.lock();
 			bool posok = playback && playback->GetPosition(position, duration, isWebChannel);
 			mutex.unlock();
 			if (posok) {
-				FileTimeOSD->update(position, duration);
-
-				if (FileTimeOSD_tmp > -1 && !FileTimeOSD->IsVisible() && g_settings.movieplayer_timeosd_while_searching)
-				{
-					FileTimeOSD->setMode(CTimeOSD::MODE_TMP);
-					FileTimeOSD->show(position);
-				}
-				if (FileTimeOSD_tmp > bisection_loop_max)
-				{
-					FileTimeOSD_tmp = -1;
-					if (FileTimeOSD->getMode() == CTimeOSD::MODE_TMP)
-						FileTimeOSD->kill();
-				}
-
-				if (duration > 100)
-					file_prozent = (unsigned char) (position / (duration / 100));
+			FileTimeOSD->update(position, duration);
+			if (duration > 100)
+				file_prozent = (unsigned char) (position / (duration / 100));
 
 #ifdef ENABLE_GRAPHLCD
 				if (!bgThread) {
@@ -2802,17 +2886,12 @@ void CMoviePlayerGui::PlayFileLoop(void)
 		const bool back_key_stop = back_key && (!g_InfoViewer || !g_InfoViewer->is_visible);
 		if (msg == (neutrino_msg_t) g_settings.mpkey_plugin) {
 			g_Plugins->startPlugin_by_name(g_settings.movieplayer_plugin.c_str ());
-#if 0
-		} else if (msg == (neutrino_msg_t) g_settings.mpkey_stop) {
-#else
-		// backKey here? Looks wrong.
 		} else if ((msg == (neutrino_msg_t) g_settings.mpkey_stop) || back_key_stop) {
 			if (back_key_stop) {
 				// Home/Back is often bound to zaphistory; suppress the next list-open side effect.
 				CNeutrinoApp::getInstance()->allowChannelList(false);
 				g_RCInput->clearRCMsg();
 			}
-#endif
 			bool timeshift_stopped = false;
 
 			if (timeshift != TSHIFT_MODE_OFF)
@@ -2853,8 +2932,6 @@ void CMoviePlayerGui::PlayFileLoop(void)
 					break;
 			}
 		} else if (msg == (neutrino_msg_t) g_settings.key_quickzap_up || msg == (neutrino_msg_t) g_settings.key_quickzap_down) {
-			quickZap(msg);
-		} else if (msg == CRCInput::RC_previoussong || msg == CRCInput::RC_nextsong) {
 			quickZap(msg);
 		} else if (fromInfoviewer && msg == CRCInput::RC_ok) {
 			if (!filelist.empty() && (filelist_it != vzap_it))
@@ -2931,15 +3008,15 @@ void CMoviePlayerGui::PlayFileLoop(void)
 			}
 			updateLcd();
 
-			//NI if (timeshift == TSHIFT_MODE_OFF)
+			if (timeshift == TSHIFT_MODE_OFF)
 				callInfoViewer();
 		} else if (msg == (neutrino_msg_t) g_settings.mpkey_bookmark) {
 #if HAVE_CST_HARDWARE || HAVE_ARM_HARDWARE
                         if (selectChapter() != 0)
 #endif
-				handleMovieBrowser((neutrino_msg_t) g_settings.mpkey_bookmark, position);
-			update_lcd = true;
-			clearSubtitle();
+                                handleMovieBrowser((neutrino_msg_t) g_settings.mpkey_bookmark, position);
+                        update_lcd = true;
+                        clearSubtitle();
 		} else if (msg == (neutrino_msg_t) g_settings.mpkey_audio) {
 			selectAudioPid();
 			update_lcd = true;
@@ -2952,7 +3029,6 @@ void CMoviePlayerGui::PlayFileLoop(void)
 			FileTimeOSD->switchMode(position, duration);
 			time_forced = false;
 			FileTimeOSD->setMpTimeForced(false);
-			FileTimeOSD_tmp = -1;
 		} else if (msg == (neutrino_msg_t) g_settings.mbkey_cover) {
 			makeScreenShot(false, true);
 		} else if (msg == (neutrino_msg_t) g_settings.key_screenshot) {
@@ -3001,13 +3077,12 @@ void CMoviePlayerGui::PlayFileLoop(void)
 			SetPosition(duration/2, true);
 		} else if (msg == CRCInput::RC_8) {	// goto end
 			SetPosition(duration - 60 * 1000, true);
-#if 0
 		} else if (msg == CRCInput::RC_page_up) {
 			SetPosition(10 * 1000);
 		} else if (msg == CRCInput::RC_page_down) {
 			SetPosition(-10 * 1000);
-#endif
-		//NI - bisectional jumps
+#if 0
+		//- bisectional jumps
 		} else if (msg == CRCInput::RC_page_up || msg == CRCInput::RC_page_down) {
 			int direction = (msg == CRCInput::RC_page_up) ? 1 : -1;
 			int jump = 10;
@@ -3015,10 +3090,7 @@ void CMoviePlayerGui::PlayFileLoop(void)
 			if (g_settings.movieplayer_bisection_jump)
 			{
 				if ((lastmsg == CRCInput::RC_page_up || lastmsg == CRCInput::RC_page_down) && (bisection_loop > -1 && bisection_loop <= bisection_loop_max))
-				{
-					if (msg != lastmsg)
-						bisection_jump /= 2;
-				}
+					bisection_jump /= 2;
 				else
 					bisection_jump = g_settings.movieplayer_bisection_jump * 60;
 
@@ -3027,6 +3099,7 @@ void CMoviePlayerGui::PlayFileLoop(void)
 			}
 
 			SetPosition(direction*jump * 1000);
+#endif
 		} else if (msg == CRCInput::RC_0) {	// cancel bookmark jump
 			handleMovieBrowser(CRCInput::RC_0, position);
 		} else if (msg == (neutrino_msg_t) g_settings.mpkey_goto) {
@@ -3076,6 +3149,16 @@ void CMoviePlayerGui::PlayFileLoop(void)
 			}
 			if (restore)
 				FileTimeOSD->show(position);
+#if 0
+		} else if (msg == CRCInput::RC_red) {
+			bool restore = FileTimeOSD->IsVisible();
+			FileTimeOSD->kill();
+			CStreamInfo2 streaminfo;
+			streaminfo.exec(NULL, "");
+			if (restore)
+				FileTimeOSD->show(position);
+			update_lcd = true;
+#endif
 		} else if (msg == NeutrinoMessages::SHOW_EPG) {
 			showMovieInfo();
 		} else if (msg == NeutrinoMessages::EVT_SUBT_MESSAGE) {
@@ -3125,9 +3208,10 @@ void CMoviePlayerGui::PlayFileLoop(void)
 				clearSubtitle();
 			}
 		}
-		//NI
+#if 0
 		if (msg < CRCInput::RC_MaxRC)
 			lastmsg = msg;
+#endif
 	}
 	printf("CMoviePlayerGui::PlayFile: exit, isMovieBrowser %d p_movie_info %p\n", isMovieBrowser, p_movie_info);
 	playstate = CMoviePlayerGui::STOPPED;
@@ -3184,47 +3268,18 @@ void CMoviePlayerGui::PlayFileEnd(bool restore)
 	stopped = true;
 	printf("%s: stopped\n", __func__);
 
-	if (file_name.find("_temp.ts") == file_name.size() - 8)
+	if (timeshift_deletion && (file_name.find("_temp.ts") == file_name.size() - 8))
 	{
-		std::string ts_src = file_name;
-		std::string xml_src = file_name;
+		std::string file = file_name;
+		printf("%s: delete %s\n", __func__, file.c_str());
+		unlink(file.c_str());
 		CMovieInfo mi;
-		if (!mi.convertTs2XmlName(xml_src))
-			xml_src.clear();
-
-		if (timeshift_to_record)
+		if (mi.convertTs2XmlName(file))
 		{
-			if (g_settings.timeshiftdir != g_settings.network_nfs_recordingdir)
-			{
-				std::string ts_dst = g_settings.network_nfs_recordingdir + "/" + ts_src.substr(ts_src.find_last_of('/') + 1);
-				std::string xml_dst = g_settings.network_nfs_recordingdir + "/" + xml_src.substr(xml_src.find_last_of('/') + 1);;
-
-				str_replace("_temp", "_ts", ts_dst);
-				str_replace("_temp", "_ts", xml_dst);
-
-				printf("%s: move %s\n", __func__, ts_src.c_str());
-				printf("%s:   to %s\n", __func__, ts_dst.c_str());
-				rename(ts_src.c_str(), ts_dst.c_str());
-				if (!xml_src.empty())
-				{
-					printf("%s: move %s\n", __func__, xml_src.c_str());
-					printf("%s:   to %s\n", __func__, xml_dst.c_str());
-					rename(xml_src.c_str(), xml_dst.c_str());
-				}
-			}
-			timeshift_to_record = false;
+			printf("%s: delete %s\n", __func__, file.c_str());
+			unlink(file.c_str());
 		}
-		else if (timeshift_deletion)
-		{
-			printf("%s: delete %s\n", __func__, ts_src.c_str());
-			unlink(ts_src.c_str());
-			if (!xml_src.empty())
-			{
-				printf("%s: delete %s\n", __func__, xml_src.c_str());
-				unlink(xml_src.c_str());
-			}
-			timeshift_deletion = false;
-		}
+		timeshift_deletion = false;
 	}
 
 	if (!filelist.empty() && filelist_it != filelist.end()) {
@@ -3753,8 +3808,7 @@ void CMoviePlayerGui::handleMovieBrowser(neutrino_msg_t msg, int /*position*/)
 
 			CMenuWidget bookStartMenu(LOCALE_MOVIEBROWSER_MENU_MAIN_BOOKMARKS, NEUTRINO_ICON_BOOKMARK_MANAGER);
 			bookStartMenu.addIntroItems();
-#if 0
-			// TODO - not supported
+#if 0 // not supported, TODO
 			bookStartMenu.addItem(new CMenuForwarder(LOCALE_MOVIEPLAYER_HEAD, !isMovieBrowser, NULL, &cSelectedMenuBookStart[0]));
 			bookStartMenu.addItem(GenericMenuSeparatorLine);
 #endif
@@ -3786,8 +3840,7 @@ void CMoviePlayerGui::handleMovieBrowser(neutrino_msg_t msg, int /*position*/)
 
 			// next seems return menu_return::RETURN_EXIT, if something selected
 			bookStartMenu.exec(NULL, "none");
-#if 0
-			// TODO - not supported
+#if 0 // not supported, TODO
 			if (cSelectedMenuBookStart[0].selected == true) {
 				/* Movieplayer bookmark */
 				if (bookmarkmanager->getBookmarkCount() < bookmarkmanager->getMaxBookmarkCount()) {
